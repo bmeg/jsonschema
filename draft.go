@@ -123,7 +123,7 @@ var (
 
 	Draft2020HyperSchema = &Draft{
 		version: 2020,
-		url:     "https://json-schema.org/draft/2020-12/hyper-schema",
+		url:     "https://json-schema.org/draft/2020-12/schema",
 		id:      "$id",
 		subschemas: joinSubschemas(Draft2019.subschemas,
 			schemaPath("prefixItems/[]"),
