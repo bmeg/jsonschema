@@ -138,6 +138,7 @@ var (
 			"format-annotation": nil,
 			"content":           nil,
 			"hyper-schema":      nil,
+			"links":             nil,
 		},
 		defaultVocabs: []string{"core", "applicator", "unevaluated", "validation"},
 	}
