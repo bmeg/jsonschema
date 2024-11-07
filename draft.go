@@ -141,13 +141,13 @@ var (
 		},
 		defaultVocabs: []string{"core", "applicator", "unevaluated", "validation"},
 	}
-	draftLatest = Draft2020
+	draftLatest = Draft2020HyperSchema
 )
 
 func init() {
 	c := NewCompiler()
 	c.AssertFormat()
-	for _, d := range []*Draft{Draft4, Draft6, Draft7, Draft2019, Draft2020} {
+	for _, d := range []*Draft{Draft4, Draft6, Draft7, Draft2019, Draft2020, Draft2020HyperSchema} {
 		d.sch = c.MustCompile(d.url)
 		for name := range d.allVocabs {
 			d.allVocabs[name] = c.MustCompile(strings.TrimSuffix(d.url, "schema") + "meta/" + name)
