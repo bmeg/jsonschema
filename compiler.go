@@ -31,10 +31,8 @@ type Compiler struct {
 	LoadURL func(s string) (io.ReadCloser, error)
 
 	// CompileRegex comples given regular expression.
-	// Defaults to golang's regexp implementation.
-	//
-	// NOTE: If you are overriding this, also ensure to override "regex" Format.
-	CompileRegex func(s string) (Regexp, error)
+	// if nil, golang's regexp implementation is used.
+	CompileRegex RegexEngine
 
 	// Formats can be registered by adding to this map. Key is format name,
 	// value is function that knows how to validate that format.
@@ -89,17 +87,13 @@ func MustCompileString(url, schema string) *Schema {
 }
 
 // NewCompiler returns a json-schema Compiler object.
-// if '$schema' attribute is missing, it is treated as draft7. to change this
-// behavior change Compiler.Draft value
+// If '$schema' attribute is missing, it uses the latest draft currently implemented by this library.
+// To change this behavior change Compiler.Draft value
 func NewCompiler() *Compiler {
 	return &Compiler{
-		Draft:     latest,
-		resources: make(map[string]*resource),
-		Formats:   make(map[string]func(interface{}) bool),
-		CompileRegex: func(s string) (Regexp, error) {
-			re, err := regexp.Compile(s)
-			return (*goRegexp)(re), err
-		},
+		Draft:      latest,
+		resources:  make(map[string]*resource),
+		Formats:    make(map[string]func(interface{}) bool),
 		Decoders:   make(map[string]func(string) ([]byte, error)),
 		MediaTypes: make(map[string]func([]byte) error),
 		extensions: make(map[string]extension),
@@ -156,24 +150,35 @@ func (c *Compiler) Compile(url string) (*Schema, error) {
 	return sch, err
 }
 
+func (c *Compiler) loadURL(url string) (io.ReadCloser, error) {
+	// check in metaschemas
+	u, meta := strings.CutPrefix(url, "http://json-schema.org/")
+	if !meta {
+		u, meta = strings.CutPrefix(url, "https://json-schema.org/")
+	}
+	if meta {
+		f, err := metaFiles.Open("metaschemas/" + u)
+		if err == nil {
+			return f, nil
+		}
+	}
+
+	// load resource
+	loadURL := LoadURL
+	if c.LoadURL != nil {
+		loadURL = c.LoadURL
+	}
+	return loadURL(url)
+
+}
+
 func (c *Compiler) findResource(url string) (*resource, error) {
 	if _, ok := c.resources[url]; !ok {
-		// load resource
-		var rdr io.Reader
-		if sch, ok := vocabSchemas[url]; ok {
-			rdr = strings.NewReader(sch)
-		} else {
-			loadURL := LoadURL
-			if c.LoadURL != nil {
-				loadURL = c.LoadURL
-			}
-			r, err := loadURL(url)
-			if err != nil {
-				return nil, err
-			}
-			defer r.Close()
-			rdr = r
+		rdr, err := c.loadURL(url)
+		if err != nil {
+			return nil, err
 		}
+		defer rdr.Close()
 		if err := c.AddResource(url, rdr); err != nil {
 			return nil, err
 		}
@@ -229,9 +234,11 @@ func (c *Compiler) findResource(url string) (*resource, error) {
 }
 
 func (c *Compiler) compileURL(url string, stack []schemaRef, ptr string) (*Schema, error) {
-	// if url points to a draft, return Draft.meta
-	if d := findDraft(url); d != nil && d.meta != nil {
-		return d.meta, nil
+	if c.CompileRegex == nil {
+		// if url points to a draft, return Draft.meta
+		if d := findDraft(url); d != nil && d.meta != nil {
+			return d.meta, nil
+		}
 	}
 
 	b, f := split(url)
@@ -487,11 +494,7 @@ func (c *Compiler) compileMap(r *resource, stack []schemaRef, sref schemaRef, re
 		s.MinLength, s.MaxLength = loadInt("minLength"), loadInt("maxLength")
 
 		if pattern, ok := m["pattern"]; ok {
-			var err error
-			s.Pattern, err = c.CompileRegex(pattern.(string))
-			if err != nil {
-				panic("regex Format and compiler.CompileRegex are incompatible")
-			}
+			s.Pattern = c.compileRegex(pattern.(string))
 		}
 
 		if r.draft.version >= 2019 {
@@ -564,13 +567,16 @@ func (c *Compiler) compileMap(r *resource, stack []schemaRef, sref schemaRef, re
 
 		if regexProps, ok := m["regexProperties"]; ok {
 			s.RegexProperties = regexProps.(bool)
+			if s.RegexProperties {
+				s.regexPropertiesFormat = c.format("regex")
+			}
 		}
 
 		if patternProps, ok := m["patternProperties"]; ok {
 			patternProps := patternProps.(map[string]interface{})
 			s.PatternProperties = make(map[Regexp]*Schema, len(patternProps))
 			for pattern := range patternProps {
-				s.PatternProperties[regexp.MustCompile(pattern)], err = compile(nil, "patternProperties/"+escape(pattern))
+				s.PatternProperties[c.compileRegex(pattern)], err = compile(nil, "patternProperties/"+escape(pattern))
 				if err != nil {
 					return err
 				}
@@ -694,11 +700,7 @@ func (c *Compiler) compileMap(r *resource, stack []schemaRef, sref schemaRef, re
 	if format, ok := m["format"]; ok {
 		s.Format = format.(string)
 		if r.draft.version < 2019 || c.AssertFormat || r.schema.meta.hasVocab("format-assertion") {
-			if format, ok := c.Formats[s.Format]; ok {
-				s.format = format
-			} else {
-				s.format = Formats[s.Format]
-			}
+			s.format = c.format(s.Format)
 		}
 	}
 
@@ -784,14 +786,25 @@ func (c *Compiler) compileMap(r *resource, stack []schemaRef, sref schemaRef, re
 }
 
 func (c *Compiler) validateSchema(r *resource, v interface{}, vloc string) error {
+	if strings.HasPrefix(r.url, "http://json-schema.org/") ||
+		strings.HasPrefix(r.url, "https://json-schema.org/") {
+		return nil
+	}
+
 	validate := func(meta *Schema) error {
-		if meta == nil {
-			return nil
-		}
 		return meta.validateValue(v, vloc)
 	}
 
-	if err := validate(r.draft.meta); err != nil {
+	meta := r.draft.meta
+	if c.CompileRegex != nil {
+		sch, err := c.Compile(r.draft.URL())
+		if err != nil {
+			return err
+		}
+		meta = sch
+	}
+
+	if err := validate(meta); err != nil {
 		return err
 	}
 	for _, ext := range c.extensions {
@@ -800,6 +813,34 @@ func (c *Compiler) validateSchema(r *resource, v interface{}, vloc string) error
 		}
 	}
 	return nil
+}
+
+func (c *Compiler) compileRegex(s string) Regexp {
+	compileRegex := c.CompileRegex
+	if compileRegex == nil {
+		compileRegex = compileGoRegex
+	}
+	re, err := compileRegex(s)
+	if err != nil {
+		panic("regex Format and compiler.CompileRegex are incompatible")
+	}
+	return re
+}
+
+func (c *Compiler) format(s string) func(interface{}) bool {
+	if s == "regex" {
+		compileRegex := c.CompileRegex
+		if compileRegex == nil {
+			compileRegex = compileGoRegex
+		}
+		return compileRegex.isValid
+	}
+
+	if format, ok := c.Formats[s]; ok {
+		return format
+	} else {
+		return Formats[s]
+	}
 }
 
 func toStrings(arr []interface{}) []string {
@@ -853,12 +894,17 @@ type Regexp interface {
 	String() string
 }
 
-type goRegexp regexp.Regexp
+type RegexEngine func(s string) (Regexp, error)
 
-func (re *goRegexp) MatchString(s string) bool {
-	return (*regexp.Regexp)(re).MatchString(s)
+func (re RegexEngine) isValid(v interface{}) bool {
+	s, ok := v.(string)
+	if !ok {
+		return true
+	}
+	_, err := re(s)
+	return err == nil
 }
 
-func (re *goRegexp) String() string {
-	return (*regexp.Regexp)(re).String()
+func compileGoRegex(s string) (Regexp, error) {
+	return regexp.Compile(s)
 }

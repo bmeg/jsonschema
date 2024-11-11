@@ -310,6 +310,14 @@ func TestInvalidSchema(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid-second json", func(t *testing.T) {
+		if err := jsonschema.NewCompiler().AddResource("test.json", strings.NewReader("{}A")); err == nil {
+			t.Error("error expected")
+		} else {
+			t.Logf("%v", err)
+		}
+	})
+
 	t.Run("multiple json", func(t *testing.T) {
 		if err := jsonschema.NewCompiler().AddResource("test.json", strings.NewReader("{}{}")); err == nil {
 			t.Error("error expected")
@@ -425,6 +433,22 @@ func TestInvalidJsonTypeError(t *testing.T) {
 		// passed: struct is not valid json type
 	default:
 		t.Fatalf("got %v. want InvalidJSONTypeErr", err)
+	}
+}
+
+func TestPercentInEnumError(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+	err := compiler.AddResource("test.json", strings.NewReader(`{"type": "string", "enum": ["%"]}`))
+	if err != nil {
+		t.Fatalf("addResource failed. reason: %v\n", err)
+	}
+	schema, err := compiler.Compile("test.json")
+	if err != nil {
+		t.Fatalf("schema compilation failed. reason: %v\n", err)
+	}
+	err = schema.Validate("hello world")
+	if strings.Contains(err.Error(), `"%!"(MISSING)`) {
+		t.Fatalf(`error contains "%%!"(MISSING)`)
 	}
 }
 
