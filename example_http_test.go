@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/bmeg/jsonschema/v6"
 )
 
 type HTTPURLLoader http.Client
@@ -41,7 +41,7 @@ func newHTTPURLLoader(insecure bool) *HTTPURLLoader {
 }
 
 func Example_fromHTTPS() {
-	schemaURL := "https://raw.githubusercontent.com/santhosh-tekuri/boon/main/tests/examples/schema.json"
+	schemaURL := "https://raw.githubusercontent.com/bmeg/boon/main/tests/examples/schema.json"
 	instanceFile := "./testdata/examples/instance.json"
 
 	loader := jsonschema.SchemeURLLoader{
