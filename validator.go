@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"slices"
 	"strconv"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/bmeg/jsonschema/v6/kind"
@@ -13,25 +14,57 @@ import (
 )
 
 func (sch *Schema) Validate(v any) error {
-	return sch.validate(v, nil, nil, nil, false, nil)
+	return sch.validateWithMode(v, nil, nil, nil, false, nil, false)
+}
+
+type FastValidationError struct {
+	SchemaURL string
+}
+
+func (e *FastValidationError) Error() string {
+	if e == nil || e.SchemaURL == "" {
+		return "jsonschema fast validation failed"
+	}
+	return fmt.Sprintf("jsonschema fast validation failed for %s", e.SchemaURL)
+}
+
+func (sch *Schema) ValidateFast(v any) error {
+	return sch.validateWithMode(v, nil, nil, nil, false, nil, true)
+}
+
+var validatorPool = sync.Pool{
+	New: func() any {
+		return &validator{
+			vloc:   make([]string, 0, 64),
+			errors: make([]*ValidationError, 0, 8),
+		}
+	},
 }
 
 func (sch *Schema) validate(v any, regexpEngine RegexpEngine, meta *Schema, resources map[jsonPointer]*resource, assertVocabs bool, vocabularies map[string]*Vocabulary) error {
-	vd := validator{
-		v:            v,
-		vloc:         make([]string, 0, 8),
-		sch:          sch,
-		scp:          &scope{sch, "", 0, nil},
-		uneval:       unevalFrom(v, sch, false),
-		errors:       nil,
-		boolResult:   false,
-		regexpEngine: regexpEngine,
-		meta:         meta,
-		resources:    resources,
-		assertVocabs: assertVocabs,
-		vocabularies: vocabularies,
-	}
+	return sch.validateWithMode(v, regexpEngine, meta, resources, assertVocabs, vocabularies, false)
+}
+
+func (sch *Schema) validateWithMode(v any, regexpEngine RegexpEngine, meta *Schema, resources map[jsonPointer]*resource, assertVocabs bool, vocabularies map[string]*Vocabulary, fast bool) error {
+	vd := validatorPool.Get().(*validator)
+	defer releaseValidator(vd)
+	vd.v = v
+	vd.vloc = vd.vloc[:0]
+	vd.sch = sch
+	vd.scp = &scope{sch, "", 0, nil}
+	vd.uneval = unevalFrom(v, sch, false)
+	vd.errors = vd.errors[:0]
+	vd.boolResult = fast
+	vd.fast = fast
+	vd.regexpEngine = regexpEngine
+	vd.meta = meta
+	vd.resources = resources
+	vd.assertVocabs = assertVocabs
+	vd.vocabularies = vocabularies
 	if _, err := vd.validate(); err != nil {
+		if fast {
+			return &FastValidationError{SchemaURL: sch.Location}
+		}
 		verr := err.(*ValidationError)
 		var causes []*ValidationError
 		if _, ok := verr.ErrorKind.(*kind.Group); ok {
@@ -50,6 +83,23 @@ func (sch *Schema) validate(v any, regexpEngine RegexpEngine, meta *Schema, reso
 	return nil
 }
 
+func releaseValidator(vd *validator) {
+	vd.v = nil
+	vd.vloc = vd.vloc[:0]
+	vd.sch = nil
+	vd.scp = nil
+	vd.uneval = nil
+	vd.errors = vd.errors[:0]
+	vd.boolResult = false
+	vd.fast = false
+	vd.regexpEngine = nil
+	vd.meta = nil
+	vd.resources = nil
+	vd.assertVocabs = false
+	vd.vocabularies = nil
+	validatorPool.Put(vd)
+}
+
 type validator struct {
 	v            any
 	vloc         []string
@@ -58,6 +108,7 @@ type validator struct {
 	uneval       *uneval
 	errors       []*ValidationError
 	boolResult   bool // is interested to know valid or not (but not actuall error)
+	fast         bool
 	regexpEngine RegexpEngine
 
 	// meta validation
@@ -238,40 +289,50 @@ func (vd *validator) objValidate(obj map[string]any) {
 	}
 
 	var additionalPros []string
-	for pname, pvalue := range obj {
-		if vd.boolResult && len(vd.errors) > 0 {
-			return
+	if len(s.PatternProperties) == 0 && s.AdditionalProperties == nil {
+		for pname, pvalue := range obj {
+			if vd.boolResult && len(vd.errors) > 0 {
+				return
+			}
+			if sch, ok := s.Properties[pname]; ok {
+				vd.addErr(vd.validateVal(sch, pvalue, pname))
+				delete(vd.uneval.props, pname)
+			}
 		}
-		evaluated := false
+	} else {
+		for pname, pvalue := range obj {
+			if vd.boolResult && len(vd.errors) > 0 {
+				return
+			}
+			evaluated := false
 
-		// properties --
-		if sch, ok := s.Properties[pname]; ok {
-			evaluated = true
-			vd.addErr(vd.validateVal(sch, pvalue, pname))
-		}
-
-		// patternProperties --
-		for regex, sch := range s.PatternProperties {
-			if regex.MatchString(pname) {
+			if sch, ok := s.Properties[pname]; ok {
 				evaluated = true
 				vd.addErr(vd.validateVal(sch, pvalue, pname))
 			}
-		}
 
-		if !evaluated && s.AdditionalProperties != nil {
-			evaluated = true
-			switch additional := s.AdditionalProperties.(type) {
-			case bool:
-				if !additional {
-					additionalPros = append(additionalPros, pname)
+			for regex, sch := range s.PatternProperties {
+				if regex.MatchString(pname) {
+					evaluated = true
+					vd.addErr(vd.validateVal(sch, pvalue, pname))
 				}
-			case *Schema:
-				vd.addErr(vd.validateVal(additional, pvalue, pname))
 			}
-		}
 
-		if evaluated {
-			delete(vd.uneval.props, pname)
+			if !evaluated && s.AdditionalProperties != nil {
+				evaluated = true
+				switch additional := s.AdditionalProperties.(type) {
+				case bool:
+					if !additional {
+						additionalPros = append(additionalPros, pname)
+					}
+				case *Schema:
+					vd.addErr(vd.validateVal(additional, pvalue, pname))
+				}
+			}
+
+			if evaluated {
+				delete(vd.uneval.props, pname)
+			}
 		}
 	}
 	if len(additionalPros) > 0 {
@@ -680,7 +741,10 @@ func (vd *validator) validateSelf(sch *Schema, refKw string, boolResult bool) er
 }
 
 func (vd *validator) validateVal(sch *Schema, v any, vtok string) error {
-	vloc := append(vd.vloc, vtok)
+	vloc := vd.vloc
+	if !vd.fast {
+		vloc = append(vd.vloc, vtok)
+	}
 	scp := vd.scp.child(sch, "", vd.scp.vid+1)
 	uneval := unevalFrom(v, sch, false)
 	subvd := validator{
@@ -703,7 +767,10 @@ func (vd *validator) validateVal(sch *Schema, v any, vtok string) error {
 }
 
 func (vd *validator) validateValue(sch *Schema, v any, vpath []string) error {
-	vloc := append(vd.vloc, vpath...)
+	vloc := vd.vloc
+	if !vd.fast {
+		vloc = append(vd.vloc, vpath...)
+	}
 	scp := vd.scp.child(sch, "", vd.scp.vid+1)
 	uneval := unevalFrom(v, sch, false)
 	subvd := validator{
